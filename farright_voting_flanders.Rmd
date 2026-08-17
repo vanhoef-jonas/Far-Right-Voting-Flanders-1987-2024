@@ -1,0 +1,994 @@
+---
+title: "Far-right voting in Flanders 1987-2024"
+author: "Jonas Vanhoef"
+date: "2026-06-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# 1. Introduction
+
+This document describes the preparation and integration of election results and geographical data used in the subsequent statistical analyses.
+The full breakdown of the data used, methodology and computational procedure can be found in the thesis.
+
+
+
+# 2. Required packages
+
+The following packages are used for data import, manipulation, spatial processing, visualisation, and statistical modelling.
+
+```{r, warning=FALSE, message=FALSE}
+library(xml2)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(sf)
+library(ggplot2)
+library(tidyr)
+library(tmap)
+library(readxl)
+library(lme4)
+library(purrr)
+library(performance)
+library(broom.mixed)
+```
+
+
+
+# 3. Imports
+
+The datasets used through this analysis.
+
+```{r warning=FALSE, message=FALSE}
+#geographical data
+cantons_geom <- st_read("geographical_data/territorialdivisions.gpkg")
+muni_geom <- st_read("geographical_data/stat_sectors_2024.sqlite")
+
+#election data
+files_can <- list.files("election_data", pattern = "\\.xml$", full.names = TRUE)
+files_muni <- list("election_data/2014.xml", "election_data/2019.xml", "election_data/2024.xml")
+
+#canton and municipal merger look-up tables
+muni_merged_lookup <- read_excel("geographical_data/municipal_mergers.xlsx")
+canton_lookup <- read_excel("geographical_data/Kantons_gemeenten.xlsx")
+
+#independent variables
+file_inhabitants <- "variables/inhabitants.xlsx"
+file_imm_noneu <- "variables/non_eu_immigrants.xlsx"
+imi_mergers <- read.csv("variables/non_eu_immigration.csv")
+prosperity <- read_excel("variables/prosperity_index.xlsx", sheet = "pros_index_fl")
+crime <- read_excel("variables/crime.xlsx")
+
+#election years
+election_years <- c(1987, 1991, 1995, 1999, 2003, 2007, 2010, 2014, 2019, 2024)
+```
+
+
+
+# 4. Canton-level elction results
+# 4.1. Extraction of election results
+
+Extract canton-level results from the XML election files (canton name, number of valid votes and number of votes for VB).
+
+```{r warning=FALSE, message=FALSE}
+#read every file and create one dataframe per year
+vb_results_can <- map(files_can, function(file){
+
+  #year from filename
+  year <- str_extract(basename(file), "\\d{4}")
+  
+  #read XML
+  doc <- read_xml(file)
+
+  #select canton nodes
+  cantons <- xml_find_all(doc, ".//level[@description='Canton']")
+
+  #extract canton results
+  results <- map_dfr(cantons, function(canton){
+
+    canton_name <- xml_text(xml_find_first(canton, "./labels/label[@language='nl']"))
+    valid_votes <- as.numeric(xml_attr(canton, "valid-votes"))
+
+    #find Vlaams Belang or Vlaams Blok party
+    vb <- xml_find_first(canton, "./lists/list[@party='VLAAMS BELANG' or @party='VLAAMS BLOK']")
+
+    if (inherits(vb, "xml_missing")) {
+      vb_votes <- 0
+    } else {
+      vb_votes <- as.numeric(xml_attr(vb, "votes"))
+    }
+
+    tibble(
+      year = as.integer(year),
+      canton = canton_name,
+      vb_votes = vb_votes,
+      valid_votes = valid_votes
+    )
+  })
+
+  results
+})
+
+
+#clean results
+vb_results_can <- bind_rows(vb_results_can)
+vb_results_can$canton <- sub("^Kanton\\s+", "", vb_results_can$canton)
+```
+
+
+
+# 4.2. Identification of Flemish cantons
+
+The election files contain cantons from across Belgium. The following step therefore excludes cantons that do not belong to the Flemish analytical sample.
+In addition, historical canton names are harmonised to their corresponding later names where geographical changes or municipal mergers require this.
+
+```{r warning=FALSE, message=FALSE}
+#create list of non-Flemish cantons and filter them
+cantons_non_fl <- list("Aarlen", "Aat", "Andenne", "Anderlecht", "Anderlues", "Antoing", "Aubel", "Aywaille", "Bastenaken", 
+                       "Beaumont", "Beauraing", "Beloeil", "Bergen", "Binche", "Bitsingen", "Borgworm", "Bouillon", "Boussu",
+                       "Brussel", "Brussel (E5)", "BZ Waals-Brabant", "BzAntwerpen", "BZBrussel-Halle-Vilvoorde", "BZHenegouwen",
+                       "BZLeuven", "BZLimburg", "BZLuik", "BZLuxemburg", "BZNamen", "BZOost-Vlaandren", "BZWest-Vlaanderen", 
+                       "Celles", "Charleroi", "Châtelet", "Chièvres", "Chimay", "Ciney", "Couvin", "Dinant", "Dison", "Doornik", 
+                       "Dour", "Doornik", "Durbuy", "E5-Kieskring Antwerpen", "E5-Kieskring Henegouwen", "E5-Kieskring Limburg",
+                       "E5-Kieskring Luik", "E5-Kieskring Luxemburg", "E5-Kieskring Namen", "E5-Kieskring Oost-Vlaanderen", 
+                       "E5-Kieskring Vlaams-Brabant", "E5-Kieskring Waals-Brabant", "E5-Kieskring West-Vlaanderen", "Edingen", 
+                       "Eghezée", "Elsene", "Erezée", "Estaimpuis", "Etalle", "Eupen", "Fauvillers", "Ferrières", "Fléron", 
+                       "Florennes", "Florenville", "Fontaine-l'Evêque", "Fosses-la-Ville", "Frameries", "Frasnes-lez-Anvaing", 
+                       "Gedinne", "Geldenaken", "Gembloux", "Genepiën", "Grâce-Hollogne", "Hannuit", "Héron", "Herstal", "Herve", 
+                       "Hoei", "Houffalize", "Komen-Waasten", "La Louvière", "La Roche-en-Ardenne", "Le Roeulx", "Lens", "Lessen", 
+                       "Leuze-en-Hainaut", "Limburg", "Luik", "Malmedy", "Marche-en-Famenne", "Merbes-le-Château", "Messancy", 
+                       "Moeskroen", "Namen", "Nandrin", "Nassogne", "Neufchâteau", "Nijvel", "Paliseul", "Péruwelz", "Perwijs", 
+                       "Philippeville", "Pont-à-Celles", "Rochefort", "Saint-Hubert", "Saint-Nicolas", "Saint-Vith", "Sainte-Ode", 
+                       "Sankt-Vith", "Schaarbeek", "Seneffe", "Seraing", "Sint-Gillis", "Sint-Jans-Molenbeek", 
+                       "Sint-Joost-ten-Node", "Spa", "Speciaal Kanton: Buza Antwerpen", "Speciaal Kanton: Buza Brussel-Hoofdstad", 
+                       "Speciaal Kanton: Buza Brussel-Hoofdstad (E3,E4,E5)", "Speciaal Kanton: Buza Henegouwen", 
+                       "Speciaal Kanton: Buza Leuven", "Speciaal Kanton: Buza Limburg", "Speciaal Kanton: Buza Luik", 
+                       "Speciaal Kanton: Buza Luxemburg", "Speciaal Kanton: Buza Namen", "Speciaal Kanton: Buza Oost-Vlaanderen", 
+                       "Speciaal Kanton: Buza Waals Brabant", "Speciaal Kanton: Buza West-Vlaanderen", "Speciaal: BuZa Antwerpen", 
+                       "Speciaal: BuZa Brussel-Halle-Vilvoorde", "Speciaal: BuZa Henegouwen", "Speciaal: BuZa Leuven", 
+                       "Speciaal: BuZa Limburg", "Speciaal: BuZa Luik", "Speciaal: BuZa Luxemburg", "Speciaal: BuZa Namen", 
+                       "Speciaal: BuZa Oost-Vlaanderen", "Speciaal: Buza Waals Brabant", "Speciaal: BuZa West-Vlaanderen", 
+                       "Stavelot", "Stemmen Uitgebracht In het Kanton Sint-Genesius-Rode", "Thuin", "Ukkel", "Verlaine", "Verviers",
+                       "Vielsalm", "Virton", "Vloesberg", "Walcourt", "Waver", "Wellin", "Wezet", "Zinnik", 
+                       "Speciaal: Buza Waals Brabant ", "Stemmen Uitgebracht In Het Kanton Sint-Genesius-Rode", 
+                       "Sint-Joost-Ten-Node", "Frasnes-Lez-Anvaing", "Étalle")
+
+
+vb_results_can <- vb_results_can %>% filter(!canton %in% cantons_non_fl)
+
+#account for name changes in cantons over time
+vb_results_can$canton <- sub("Nevele", "Aalter", vb_results_can$canton)
+vb_results_can$canton <- sub("Oosterzele", "Merelbeke", vb_results_can$canton)
+vb_results_can$canton <- sub("Kruishoutem", "Kruisem", vb_results_can$canton)
+vb_results_can$canton <- sub("Harelbeke", "Waregem", vb_results_can$canton)
+vb_results_can$canton <- sub("^Puurs$", "Puurs-Sint-Amands", vb_results_can$canton)
+vb_results_can$canton <- sub("Neerpelt", "Pelt", vb_results_can$canton)
+vb_results_can$canton <- sub("Mesen", "Heuvelland", vb_results_can$canton)
+vb_results_can$canton <- sub("Beveren-Waas", "Beveren", vb_results_can$canton)
+
+#remove Sint-Genesius-Rode and Zaventem due to incomplete number of elections
+vb_results_can <- vb_results_can %>% filter(!canton %in% "Sint-Genesius-Rode")
+vb_results_can <- vb_results_can %>% filter(!canton %in% "Zaventem")
+
+#merge cantons due to changes over time
+vb_results_can <- vb_results_can %>%
+  mutate(canton = case_when(canton == "Zomergem" | canton == "Waarschoot" ~ "Lievegem",
+                            canton == "Lichtervelde" ~ "Hooglede",
+                            canton == "Zonnebeke" ~ "Ieper",
+                            TRUE ~ canton)) %>%
+  group_by(year, canton) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+#calculate vote share
+vb_results_can <- vb_results_can %>% mutate(vb_perc = (vb_votes/valid_votes)*100) 
+vb_results_can$vb_perc <- round(vb_results_can$vb_perc, 2)
+```
+
+
+
+# 4.3. Vlaams Belang vote share over time
+
+The following figure provides a descriptive overview of the VB vote share at Flemish scale over the observation period.
+
+```{r warning=FALSE, message=FALSE}
+#calculate percentage of votes for the Chamber as compared to votes for Flanders
+tot_perc_vb <- vb_results_can %>% group_by(year) %>% summarise(tot_perc = (sum(vb_votes)/sum(valid_votes)*100))
+
+#plot Flanders-wide results
+ggplot(tot_perc_vb, aes(year, tot_perc, label = round(tot_perc, 2))) + geom_line() + geom_point() +
+  scale_x_continuous(
+    breaks = c(1987, 1991, 1995, 1999, 2003, 2007, 2010, 2014, 2019, 2024),
+    limits = c(1987, 2026)) +
+  scale_y_continuous(breaks = c(0, 5, 10, 15, 20, 25), limits = c(1, 24)) +
+  theme_classic() + xlab("Election year") + ylab("% votes VB") + geom_text(nudge_y = -0.3, nudge_x = 1.5, size = 3.5)
+
+#clean up
+vb_results_can <- vb_results_can %>% select(-vb_votes, -valid_votes)
+```
+
+
+# 4.4. Preparation of spatial election data
+
+The cleaned canton-level election results are joined to the geographical boundaries. The resulting dataset is reshaped into a wide format, with one column per election year, and exported as a GeoPackage for subsequent spatial analysis and visualisation.
+
+```{r warning=FALSE, message=FALSE}
+#merge election data and geographical data
+cantons_geom <- cantons_geom %>% select(cantonheadoffice, shape)
+cantons_full <- vb_results_can %>% left_join(cantons_geom, by = c("canton" = "cantonheadoffice"))
+
+#pivot table
+cantons_plot <- cantons_full %>% select(canton, year, vb_perc, shape)
+cantons_plot <- cantons_plot %>%
+  pivot_wider(names_from = year, values_from = vb_perc)
+
+#export data
+st_write(cantons_plot, "output/cantons_plot.gpkg")
+```
+
+
+
+# 5. Municipal-level elction results
+# 5.1. Extraction of election results
+
+Extract Municipal-level results from the XML election files (Municipality name, number of valid votes and number of votes for VB).
+
+```{r warning=FALSE, message=FALSE}
+#read every file and create one dataframe per year
+vb_results_muni <- map(files_muni, function(file){
+
+  #year from filename
+  year <- str_extract(basename(file), "\\d{4}")
+
+  #read XML
+  doc <- read_xml(file)
+
+  #select municipality nodes
+  municipalities <- xml_find_all(doc, ".//level[@description='Municipality']")
+
+  #extract municipality results
+  results <- map_dfr(municipalities, function(municipality){
+
+    municipality_name <- xml_text(xml_find_first(municipality, "./labels/label[@language='nl']"))
+    valid_votes <- as.numeric(xml_attr(municipality, "valid-votes"))
+
+    #find Vlaams Belang or Vlaams Blok
+    vb <- xml_find_first(municipality, "./lists/list[@party='VLAAMS BELANG' or @party='VLAAMS BLOK']")
+
+    if (inherits(vb, "xml_missing")) {
+      vb_votes <- 0
+    } else {
+      vb_votes <- as.numeric(xml_attr(vb, "votes"))
+    }
+
+    tibble(
+      year = as.integer(year),
+      municipality = municipality_name,
+      vb_votes = vb_votes,
+      valid_votes = valid_votes,
+    )
+  })
+
+  results
+})
+
+
+#merge the output
+vb_results_muni <- bind_rows(vb_results_muni)
+
+#deal with the 2019 municipal mergers by merging the original municipalities
+vb_results_muni <- vb_results_muni %>%
+  mutate(municipality = case_when(municipality == "Kruishoutem" | municipality == "Zingem" ~ "Kruisem",
+                            municipality == "Meeuwen-Gruitrode" | municipality == "Opglabbeek" ~ "Oudsbergen",
+                            municipality == "Neerpelt" | municipality == "Overpelt" ~ "Pelt",
+                            municipality == "Puurs" | municipality == "Sint-Amands" ~ "Puurs-Sint-Amands",
+                            municipality == "Lovendegem" | municipality == "Waarschoot" | municipality == "Zomergem" ~ "Lievegem",
+                            municipality == "Knesselare" ~ "Aalter",
+                            municipality == "Nevele" ~ "Deinze",
+                            TRUE ~ municipality)) %>%
+  group_by(year, municipality) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+#calculate votes
+vb_results_muni <- vb_results_muni %>% mutate(vb_perc = (vb_votes/valid_votes)*100) 
+vb_results_muni$vb_perc <- round(vb_results_muni$vb_perc, 2)
+vb_results_muni <- vb_results_muni %>% select(-valid_votes, -vb_votes)
+```
+
+
+# 5.2. Preparation of spatial election data
+
+The cleaned municipal-level election results are joined to the geographical boundaries. The resulting dataset is reshaped into a wide format, with one column per election year, and exported as a GeoPackage for subsequent spatial analysis and visualisation.
+
+
+```{r warning=FALSE, message=FALSE}
+#join election and geographical data
+muni_geom <- muni_geom %>% group_by(cd_munty_refnis, tx_munty_descr_nl,cd_rgn_refnis) %>% summarise()
+
+munis_full <- vb_results_muni %>% left_join(muni_geom, by = c("municipality" = "tx_munty_descr_nl"))
+munis_full <- munis_full %>% filter(cd_rgn_refnis == "02000") %>% st_as_sf
+munis_full <- munis_full %>% select(-cd_rgn_refnis)
+
+#pivot table
+munis_plot <- munis_full %>% select(municipality, year, vb_perc, GEOMETRY)
+munis_plot <- munis_plot %>% pivot_wider(names_from = year, values_from = vb_perc)
+
+#export data
+st_write(munis_plot, "output/munis_plot.gpkg")
+```
+
+
+
+# 6. Transform independent variables
+
+The following section outlines the transforming of the original independent variables to the data structure needed for further analysis. This includes, cleaning, pre-processing and extrapolation of the data.
+
+
+# 6.1. Inhabitants per municipality
+```{r warning=FALSE, message=FALSE}
+#read in population data and construct dataframe
+population <- lapply(excel_sheets(file_inhabitants), function(sheet) {
+  df <- read_excel(file_inhabitants, sheet = sheet)
+  df$year <- as.numeric(sheet)
+  df
+}) |> bind_rows()
+
+#deal with municipal mergers
+population_long <- population %>%
+  mutate(Woonplaats = case_when(Woonplaats == "Kruishoutem" | Woonplaats == "Zingem" ~ "Kruisem",
+                            Woonplaats == "Meeuwen-Gruitrode" | Woonplaats == "Opglabbeek" ~ "Oudsbergen",
+                            Woonplaats == "Neerpelt" | Woonplaats == "Overpelt" ~ "Pelt",
+                            Woonplaats == "Puurs" | Woonplaats == "Sint-Amands" ~ "Puurs-Sint-Amands",
+                            Woonplaats == "Lovendegem" | Woonplaats == "Waarschoot" | Woonplaats == "Zomergem" ~ "Lievegem",
+                            Woonplaats == "Knesselare" ~ "Aalter",
+                            Woonplaats == "Nevele" ~ "Deinze",
+                            TRUE ~ Woonplaats)) %>%
+  group_by(year, Woonplaats) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE), .groups = "drop")
+
+#transform to long format
+population_long <- population_long %>% filter(population_long$Woonplaats %in% munis_plot$municipality)
+population_long <- population_long %>% rename(municipality = Woonplaats, population = Totaal)
+```
+
+
+
+# 6.2. Prosperity per municipality
+```{r warning=FALSE, message=FALSE}
+#pivot data to long format
+prosperity_long <- prosperity %>% pivot_longer( cols = -Gemeente, names_to = "year", values_to = "prosperity" ) %>% 
+                    mutate( year = as.numeric(year), prosperity = as.numeric(prosperity) ) %>% 
+                    arrange(Gemeente, year)
+
+#construct function for extrapolation of the data based on election years
+estimate_municipality <- function(data) { 
+  #Llinear model 
+  linear_model <- lm(prosperity ~ year, data = data) 
+  #years outside the observed period 
+  years_to_estimate <- election_years[ !election_years %in% data$year ] 
+  #predictions 
+  if (length(years_to_estimate) > 0) {
+    prediction_data <- data.frame(year = years_to_estimate) 
+    prediction_data$linear <- predict(linear_model, newdata = prediction_data) 
+    prediction_data
+  } else {
+    data.frame(year = numeric(0), linear = numeric(0))} 
+}
+
+#obtain estimated values for election years not included in the data
+estimated_values <- prosperity_long %>% group_by(Gemeente) %>% nest() %>% 
+  mutate( estimates = map( data, estimate_municipality ) ) %>% 
+  select(Gemeente, estimates) %>% 
+  unnest(estimates)
+
+#merge the original data with the predictions and clean results
+prosperity_long <- prosperity_long %>% filter(year %in% election_years) %>%
+  select(Gemeente, year, observed = prosperity) %>% 
+  full_join(estimated_values, by = c("Gemeente", "year")) %>% 
+  mutate(prosperity = ifelse(!is.na(observed), observed, linear)) %>% 
+  arrange(Gemeente, year)
+prosperity_long <- prosperity_long %>% select(-observed, -linear)
+prosperity_long <- prosperity_long %>% rename(municipality = Gemeente)
+```
+
+
+
+# 6.3. Non-EU immigrants per municipality
+```{r warning=FALSE, message=FALSE}
+#read in immigration data and construct data frame (for non-merged municipalities)
+imm_noneu <- lapply(excel_sheets(file_imm_noneu), function(sheet) {
+  df <- read_excel(file_imm_noneu, sheet = sheet)
+  df$year <- as.numeric(sheet)
+  df
+}) |> bind_rows()
+
+#clean data and retain only necessary information
+imm_noneu <- imm_noneu %>% fill(Woonplaats)
+imm_noneu <- imm_noneu %>% filter(`Nationaliteitsgroep van herkomst` == "Buiten EU27")
+imm_noneu <- imm_noneu %>% mutate( Woonplaats = str_remove(Woonplaats, " \\(.*\\)"))
+
+imm_noneu_long <- imm_noneu %>% filter(imm_noneu$Woonplaats %in% munis_plot$municipality)
+imm_noneu_long <- imm_noneu_long %>% rename(municipality = Woonplaats, migrants = Totaal)
+
+
+#clean data and retain on ly necessary information for merged municipalities
+imi_mergers <- imi_mergers %>% filter(TX_DESCR_ORIGIN_NL != "België" & TX_DESCR_ORIGIN_NL != "Verenigd Koninkrijk" &
+                      TX_DESCR_ORIGIN_NL != "Nederland" & TX_DESCR_ORIGIN_NL != "Luxemburg (Groot Hertogdom)" &
+                      TX_DESCR_ORIGIN_NL != "EU-15" & TX_DESCR_ORIGIN_NL != "EU-13" &
+                      TX_DESCR_ORIGIN_NL != "Duitsland" & TX_DESCR_ORIGIN_NL != "Frankrijk")
+imi_mergers <- imi_mergers %>% group_by(cd_refnis_mun_25, year) %>% summarise(migrants = sum(totaal_aantal))
+imi_mergers <- imi_mergers %>% filter(year < "2025")
+imi_mergers$cd_refnis_mun_25 <- as.character(imi_mergers$cd_refnis_mun_25)
+
+
+#select merge both data frames and retain only necessary information
+imi_mergers <- imi_mergers %>% full_join(st_drop_geometry(muni_geom), by = c("cd_refnis_mun_25" = "cd_munty_refnis"))
+imi_mergers <- imi_mergers %>% filter(cd_rgn_refnis == "02000")
+
+imi_empty <- imi_mergers %>% filter(is.na(migrants))
+imi_add <- imm_noneu_long %>% filter(imm_noneu_long$municipality %in% imi_empty$tx_munty_descr_nl) %>% 
+  select(-`Nationaliteitsgroep van herkomst`) %>% rename(tx_munty_descr_nl = municipality)
+
+imm_noneu_long <- bind_rows(imi_mergers, imi_add)
+imm_noneu_long <- imm_noneu_long %>% select(tx_munty_descr_nl, year, migrants) %>% rename(municipality = tx_munty_descr_nl)
+imm_noneu_long <- imm_noneu_long[complete.cases(imm_noneu_long$migrants),]
+
+
+#extrapolate the data to account for the missing information (exponential model)
+estimate_municipality <- function(data) {
+  
+  #first observed year for this municipality
+  first_year <- min(data$year, na.rm = TRUE)
+  
+  #center year around first observed year
+  data <- data %>%
+    mutate(year_centered = year - first_year)
+  
+  #exponential model: migrants = a * exp(b * year_centered)
+  exponential_model <- lm(log(migrants) ~ year_centered, data = data)
+  
+  #years outside the observed period
+  years_to_estimate <- election_years[!election_years %in% data$year]
+  
+  #predictions
+  if (length(years_to_estimate) > 0) {
+    
+    prediction_data <- data.frame(year = years_to_estimate) %>%
+      mutate(year_centered = year - first_year)
+    
+    #predict on log scale and transform back
+    prediction_data$exponential <- exp(predict(exponential_model, newdata = prediction_data))
+    prediction_data
+    
+  } else {
+    
+    data.frame(
+      year = numeric(0),
+      exponential = numeric(0)
+    )
+  }
+}
+
+#obtain estimated values for election years not included in the data
+estimated_values <- imm_noneu_long %>% group_by(municipality) %>%
+  nest() %>% mutate(estimates = map(data, estimate_municipality)) %>%
+  select(municipality, estimates) %>%
+  unnest(estimates)
+
+#merge the original data with the predictions and clean results
+imm_noneu_long <- imm_noneu_long %>%
+  filter(year %in% election_years) %>%
+  select(municipality, year, observed = migrants) %>%
+  full_join(estimated_values, by = c("municipality", "year")) %>%
+  mutate(migrants = ifelse(!is.na(observed), observed, exponential)) %>%
+  arrange(municipality, year)
+```
+
+
+
+# 6.4. Number of crimes per municipality
+```{r warning=FALSE, message=FALSE}
+#change data format muncipal look-up table 
+muni_merged_lookup <- muni_merged_lookup %>%
+  separate_rows(muni_orig, sep = ",")
+
+#select the means of the amount of crime between election years to obtain more general trend
+crime <- crime %>%
+  mutate(
+    `2003` = rowMeans(select(., `2000`:`2003`), na.rm = TRUE),
+    `2007` = rowMeans(select(., `2004`:`2007`), na.rm = TRUE),
+    `2010` = rowMeans(select(., `2008`:`2010`), na.rm = TRUE),
+    `2014` = rowMeans(select(., `2011`:`2014`), na.rm = TRUE),
+    `2019` = rowMeans(select(., `2015`:`2019`), na.rm = TRUE),
+    `2024` = rowMeans(select(., `2020`:`2024`), na.rm = TRUE)
+  ) %>%
+  select(municipality, `2003`, `2007`, `2010`, `2014`, `2019`, `2024`)
+
+crime <- crime %>% pivot_longer(cols = c(`2003`, `2007`, `2010`, `2014`, `2019`, `2024`))
+crime <- crime %>% rename(year = name, crime = value)
+
+#disaggregate data for merged municipalities based on population data and transform to long format
+pop_merged <- population_long %>% filter(year == 2024 | year == 2019 | year == 2014 | year == 2010 | year == 2007 | year == 2003)
+pop_merged <- pop_merged %>% left_join(muni_merged_lookup, by = c("municipality" = "muni_orig"))
+pop_merged <- pop_merged[complete.cases(pop_merged$muni_merged),]
+pop_merged <- pop_merged %>% group_by(muni_merged, year) %>% 
+  mutate(total_population = sum(population, na.rm = TRUE),
+         population_share = population / total_population) %>%
+  ungroup()
+
+crime$year <- as.numeric(crime$year)
+pop_merged <- pop_merged %>% left_join(crime, by = c("muni_merged" = "municipality", "year" = "year")) %>%
+  mutate(crime_disaggregated = crime * population_share)
+pop_merged <- pop_merged %>% select(municipality, year, crime_disaggregated) %>% rename(crime = crime_disaggregated)
+
+crime <- crime %>% filter(!(municipality %in% muni_merged_lookup$muni_merged))
+crime_long <- crime %>% add_row(pop_merged)
+
+
+#construct function for extrapolation of the data based on election years
+estimate_municipality <- function(data) { 
+  #linear model 
+  linear_model <- lm(crime ~ year, data = data) 
+  #years outside the observed period 
+  years_to_estimate <- election_years[ !election_years %in% data$year ] 
+  #predictions 
+  if (length(years_to_estimate) > 0) {
+    prediction_data <- data.frame(year = years_to_estimate) 
+    prediction_data$linear <- predict(linear_model, newdata = prediction_data) 
+    prediction_data
+  } else {
+    data.frame(year = numeric(0), linear = numeric(0))} 
+}
+
+#obtain estimated values for election years not included in the data
+estimated_values <- crime_long %>% group_by(municipality) %>% nest() %>% 
+  mutate(estimates = map(data, estimate_municipality ) ) %>% 
+  select(municipality, estimates) %>% 
+  unnest(estimates)
+
+#merge the original data with the predictions and clean results
+crime_long <- crime_long %>% filter(year %in% election_years) %>%
+  select(municipality, year, observed = crime) %>% 
+  full_join(estimated_values, by = c("municipality", "year")) %>% 
+  mutate(crime = ifelse(!is.na(observed), observed, linear)) %>% 
+  arrange(municipality, year)
+crime_long <- crime_long %>% select(-observed, -linear)
+crime_long <- crime_long %>% rename(municipality = municipality)
+```
+
+
+
+# 7. Prepare data for model
+# 7.1. Merge independent variables
+
+The following section includes the merging of all independent variables.
+
+```{r warning=FALSE, message=FALSE}
+canton_lookup <- canton_lookup %>%
+  separate_rows(municipality, sep = ",")
+
+municipal_data <- prosperity_long %>%
+  left_join(
+    population_long,
+    by = c("municipality", "year")
+  ) %>%
+  left_join(
+    imm_noneu_long,
+    by = c("municipality", "year")
+  ) %>%
+  left_join(
+    crime_long,
+    by = c("municipality", "year")
+  ) %>% 
+  left_join(
+    canton_lookup,
+    by = "municipality"
+  )
+```
+
+
+
+# 7.2. Aggregate independent variables at cantonal level
+
+Aggregate all data to cantonal level and compute the final independent variables.
+
+```{r warning=FALSE, message=FALSE}
+#aggregate to canton level
+canton_data <- municipal_data %>%
+  group_by(canton, year) %>%
+  summarise(
+    prosperity = weighted.mean(
+      prosperity,
+      population,
+      na.rm = TRUE
+    ),
+    migrants = weighted.mean(
+      migrants,
+      population,
+      na.rm = TRUE
+    ),
+    crime = weighted.mean(
+      crime,
+      population,
+      na.rm = TRUE
+    ),
+    population = sum(
+      population,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+
+#remove two unused cantons and join data for final calculations
+canton_data <- canton_data %>% filter(canton != "Zaventem") %>% filter(canton != "Sint-Genesius-Rode")
+canton_data <- canton_data %>% left_join(cantons_full, by = c("canton", "year"))
+canton_data <- canton_data %>% st_as_sf()
+
+#compute the final version of the independent variables
+canton_data <- canton_data %>% mutate(area = as.numeric(st_area(shape)/1000000))
+canton_data <- canton_data %>% mutate(migrants_perc = (migrants/population)*100)
+canton_data <- canton_data %>% mutate(pop_dens = (population)/area)
+canton_data <- canton_data %>% mutate(crime_rate = crime/(population/1000))
+```
+
+
+
+# 7.3. Aggregate independent variables at municipal level
+
+Aggregate all data to municipal level and compute the final independent variables.
+
+```{r warning=FALSE, message=FALSE}
+#only select data for 2014, 2019 and 2024
+municipal_data_rec <- municipal_data %>% filter(year == "2014" | year == "2019" | year == "2024")
+municipal_data_rec <- municipal_data_rec %>% left_join(munis_full, by = c("municipality", "year"))
+municipal_data_rec <- municipal_data_rec %>% st_as_sf()
+
+#compute the final version of the independent variables
+municipal_data_rec <- municipal_data_rec %>% mutate(area = as.numeric(st_area(GEOMETRY)/1000000))
+municipal_data_rec <- municipal_data_rec %>% mutate(migrants_perc = (migrants/population)*100)
+municipal_data_rec <- municipal_data_rec %>% mutate(pop_dens = (population)/area)
+municipal_data_rec <- municipal_data_rec %>% mutate(crime_rate = crime/(population/1000))
+```
+
+
+
+# 7.4. Prepare each dataset for the model
+
+calculating "between" and "within" levels of the independent variables.
+
+```{r warning=FALSE, message=FALSE}
+#canton level calculations
+canton_data <- canton_data %>%
+  group_by(canton) %>%
+  mutate(
+    prosperity_between = mean(prosperity, na.rm = TRUE),
+    prosperity_within  = prosperity - prosperity_between,
+
+    crime_between = mean(crime_rate, na.rm = TRUE),
+    crime_within  = crime_rate - crime_between,
+
+    mig_between = mean(migrants_perc, na.rm = TRUE),
+    mig_within  = migrants_perc - mig_between
+    
+  ) %>%
+  ungroup()
+
+
+#split dataset according to the three predetermined phases
+canton_data_1 <- canton_data %>%
+  filter(year >= 1987, year <= 2007)
+
+canton_data_2 <- canton_data %>%
+  filter(year >= 2007, year <= 2014)
+
+canton_data_3 <- canton_data %>%
+  filter(year >= 2014, year <= 2024)
+
+
+#municipality level calculations
+municipal_data_rec <- municipal_data_rec %>%
+  group_by(municipality) %>%
+  mutate(
+    prosperity_between = mean(prosperity, na.rm = TRUE),
+    prosperity_within  = prosperity - prosperity_between,
+
+    crime_between = mean(crime_rate, na.rm = TRUE),
+    crime_within  = crime_rate - crime_between,
+
+    mig_between = mean(migrants_perc, na.rm = TRUE),
+    mig_within  = migrants_perc - mig_between
+    
+  ) %>%
+  ungroup()
+
+
+#save final data
+saveRDS(municipal_data, "output/municipal_data_rec.RDS")
+saveRDS(municipal_data, "output/municipal_data_.RDS")
+saveRDS(canton_data, "output/canton_data.RDS")
+```
+
+
+
+# 8. Compute models and analyse output for each phase
+# 8.1. Compute models
+
+The computation of the models for each of the phases can be found in this section, including the municipal-level model.
+
+```{r warning=FALSE, message=FALSE}
+#1987-2007
+model_1 <- lmer(
+  vb_perc ~
+    
+    prosperity_between +
+    prosperity_within +
+
+    crime_between +
+    crime_within +
+
+    mig_between +
+    mig_within +
+
+    pop_dens +
+
+    (1 | canton),
+
+  data = canton_data_1
+)
+
+#2007-2014
+model_2 <- lmer(
+   vb_perc ~
+
+    prosperity_between +
+    prosperity_within +
+
+    crime_between +
+    crime_within +
+
+    mig_between +
+    mig_within +
+
+    pop_dens +
+
+    (1 | canton),
+
+  data = canton_data_2
+)
+
+#2014-2024 (at canton level)
+model_3_can <- lmer(
+  vb_perc ~
+
+    prosperity_between +
+    prosperity_within +
+
+    crime_between +
+    crime_within +
+
+    mig_between +
+    mig_within +
+
+    pop_dens +
+
+    (1 | canton),
+
+  data = canton_data_3
+)
+
+#2014-2024 (at municipal level)
+model_3_muni <- lmer(
+  vb_perc ~
+
+    prosperity_between +
+    prosperity_within +
+
+    crime_between +
+    crime_within +
+
+    mig_between +
+    mig_within +
+
+    pop_dens +
+
+    (1 | municipality),
+
+  data = municipal_data_rec
+)
+```
+
+
+
+# 8.2. Analyse model results
+
+Check the summary and results of each model as well as potential (multi-)collinearity.
+
+```{r warning=FALSE, message=FALSE}
+#model results
+summary(model_1)
+summary(model_2)
+summary(model_3_can)
+summary(model_3_muni)
+```
+
+
+```{r warning=FALSE, message=FALSE}
+#check for collinearity between the independent variables
+check_collinearity(model_1)
+check_collinearity(model_2)
+check_collinearity(model_3_can)
+check_collinearity(model_3_muni)
+```
+
+
+
+# 8.3. Plot model results at cantonal level
+
+The following sections plot the model results at canton level for each of the independent variables' coefficients.
+
+```{r warning=FALSE, message=FALSE}
+#get confidence intervals of each variables coefficient for each phase
+p1 <- tidy(model_1, effects = "fixed", conf.int = TRUE) %>%
+  mutate(phase = "1987–2007")
+
+p2 <- tidy(model_2, effects = "fixed", conf.int = TRUE) %>%
+  mutate(phase = "2007–2014")
+
+p3 <- tidy(model_3_can, effects = "fixed", conf.int = TRUE) %>%
+  mutate(phase = "2014–2024")
+
+p4 <- tidy(model_3_muni, effects = "fixed", conf.int = TRUE) %>%
+  mutate(phase = "2014–2024")
+
+
+#merge together for the cantonal models
+results <- bind_rows(p1, p2, p3)
+
+#structure results and naming in the data frame (and plot)
+results_plot <- results %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    variable = recode(
+      term,
+      prosperity_between = "Prosperity (between)",
+      prosperity_within  = "Prosperity (within)",
+      crime_between      = "Crime rate (between)",
+      crime_within       = "Crime rate (within)",
+      mig_between        = "Immigration (between)",
+      mig_within         = "Immigration (within)",
+      pop_dens           = "Population density"
+    )
+  )
+
+
+results_plot <- results_plot %>%
+  mutate(
+    variable = factor(
+      variable,
+      levels = c(
+        "Prosperity (between)",
+        "Prosperity (within)",
+        "Crime rate (between)",
+        "Crime rate (within)",
+        "Immigration (between)",
+        "Immigration (within)",
+        "Population density"
+      )
+    )
+  )
+
+
+#plot results
+ggplot(results_plot, aes(x = estimate, y = phase, colour = phase)) +
+  geom_vline(xintercept = 0, linetype = "dashed",) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.15, show.legend = FALSE) +
+  geom_point(size = 3, show.legend = FALSE) +
+  
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(x = "Fixed-effect estimate (95% CI)", y = NULL, colour = "Phase") +
+  theme_minimal() +
+  theme(panel.spacing.x = unit(3, "lines"))
+```
+
+
+
+# 8.4. Plot model results for final phase
+
+The following sections plot the model results for each of the independent variables' coefficients at canton level and at municipal level for the 2014-2024 phase.
+
+```{r warning=FALSE, message=FALSE}
+#merge the model results for the last phase together (both canton and municipal)
+p4 <- p4 %>% mutate(type = "Municipality")
+p3 <- p3 %>% mutate(type = "Canton")
+  
+results2 <- bind_rows(p3, p4)
+
+
+#structure results and naming in the data frame (and plot)
+results_plot2 <- results2 %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    variable = recode(
+      term,
+      prosperity_between = "Prosperity (between)",
+      prosperity_within  = "Prosperity (within)",
+      crime_between      = "Crime rate (between)",
+      crime_within       = "Crime rate (within)",
+      mig_between        = "Immigration (between)",
+      mig_within         = "Immigration (within)",
+      pop_dens           = "Population density"
+    )
+  )
+
+
+results_plot2 <- results_plot2 %>%
+  mutate(
+    variable = factor(
+      variable,
+      levels = c(
+        "Prosperity (between)",
+        "Prosperity (within)",
+        "Crime rate (between)",
+        "Crime rate (within)",
+        "Immigration (between)",
+        "Immigration (within)",
+        "Population density"
+      )
+    )
+  )
+
+
+#plot results
+ggplot(results_plot2, aes(x = estimate, y = type, colour = type)) +
+  geom_vline(xintercept = 0, linetype = "dashed",) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.15, show.legend = TRUE) +
+  geom_point(size = 3, show.legend = TRUE) +
+  
+  facet_wrap(~ variable, scales = "free_x", ncol = 2) +
+  labs(x = "Fixed-effect estimate (95% CI)", y = NULL, colour = "type") +
+  theme_minimal() +
+  theme(panel.spacing.x = unit(3, "lines"))
+```
+
+
+
+# 8.5. Compare cantonal and municipal model for final phase
+
+This final sections check whether the difference in the coefficient for each of the independent variables in both models are statistically significant or not.
+
+```{r warning=FALSE, message=FALSE}
+#aggregate model data for municipal and canton level of final phase
+canton_data_3$level_id <- paste0("C_", canton_data_3$canton)
+municipal_data_rec$level_id <- paste0("M_", municipal_data_rec$municipality)
+
+canton_data_3$level <- "Canton"
+municipal_data_rec$level <- "Municipality"
+
+combined_data <- bind_rows(canton_data_3, municipal_data_rec)
+combined_data$level <- factor(combined_data$level, levels = c("Canton", "Municipality"))
+```
+
+
+```{r warning=FALSE, message=FALSE}
+#run combined data model
+model_level <- lmer(
+  vb_perc ~
+    level * (
+      prosperity_between + prosperity_within +
+      crime_between + crime_within +
+      mig_between + mig_within +
+      pop_dens
+    ) +
+    (1 | level_id),
+  data = combined_data
+)
+
+#plot results
+summary(model_level)
+```
+
